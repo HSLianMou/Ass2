@@ -17,7 +17,7 @@ where
     M: Manager,
 {
     let (mut recv, mut send) = manager.accept_new_connection().unwrap();
-    let mut data_base: HashMap<String, CellValue> = HashMap::new();
+    // let mut data_base: HashMap<String, CellValue> = HashMap::new();
     let mut data_base_matrix: Vec<Vec<CellValue>> = vec![vec![CellValue::None; 10]; 26];
 
     loop {
@@ -49,19 +49,6 @@ where
                         }    
                     }
                 }
-                // if let Some(value) = parts.get(1).and_then(|&key| data_base.get(key)) {
-                //     match value {
-                //         CellValue::Error(err) => {
-                //             send.write_message(Reply::Error(format!("{} = Error: '{}'", parts[1], err)))
-                //         },
-                //         _ => {
-                //             send.write_message(Reply::Value(parts[1].to_string(), value.clone()))
-                //         }
-                //     }?;
-                //     // println!("{:?}",value.clone());
-                // } else {
-                //     send.write_message(Reply::Error(format!("Variable not found")));
-                // }
             },
 
             Some(&"set") => {
@@ -71,20 +58,37 @@ where
                     send.write_message(Reply::Error(format!("Invalid Key Provided")));
                 } else {
                     let key = parts[1];
-                    
                     let expression = parts[2..].join(" ");
-                    let runner = CommandRunner::new(&expression);
-                    let result = runner.run(&HashMap::new());
-                    if let Ok((col, row)) = split_key(parts[1]) {
-                        set_cell_in_matrix(&mut data_base_matrix, col, row, result.clone());
+                    if expression.starts_with("sum"){
+                        let range = &expression[4..expression.len()-1];
+                        let matrix_arg = extract_matrix_for_sum(range, &data_base_matrix);
+                        // println!("{:?}", matrix_arg);
+                        let result = CommandRunner::new(&format!("sum({})", range)).run(&HashMap::from([(range.to_string(), matrix_arg)]));
+                        if let Ok((col, row)) = split_key(parts[1]) {
+                            set_cell_in_matrix(&mut data_base_matrix, col, row, result.clone());
+                        }
+                        send.write_message(Reply::Value(key.to_string(), result))?;
+                    } else {
+                        match replaced_cells_expression(&expression, &data_base_matrix) {
+                            Ok(replaced_expression) => {
+                                let runner = CommandRunner::new(&replaced_expression);
+                                let result = runner.run(&HashMap::new());
+                                if let Ok((col, row)) = split_key(parts[1]) {
+                                    set_cell_in_matrix(&mut data_base_matrix, col, row, result.clone());
+                                }
+                                println!("{}", result);
+                            },
+    
+                            Err(e) => {
+                                send.write_message(Reply::Error(format!("Error")))?;
+                            }
+                        };
                     }
-                    println!("{}", result);
-                    data_base.insert(key.to_string().clone(), result.clone());
+                    
                 }
             },
 
-            None => todo!(),
-            Some(&&_) => todo!()
+            _ => todo!()
         }
     }
 }
@@ -120,14 +124,13 @@ fn split_key(key: &str) -> Result<(usize, usize), &'static str> {
         let col_num = column_name_to_number(column_part);
         let row_num: usize = row_part.parse().map_err(|_| "Invalid row")?;
 
-        Ok((col_num.saturating_sub(1).try_into().unwrap(), row_num.saturating_sub(1)))
+        Ok((col_num.try_into().unwrap(), row_num.saturating_sub(1)))
     } else {
         Err("Invalid cell reference format")
     }
 }
 
 fn set_cell_in_matrix(matrix: &mut Vec<Vec<CellValue>>, col: usize, row: usize, value: CellValue) {
-    // 确保矩阵的大小能够容纳新值
     if row >= matrix.len() {
         matrix.resize_with(row + 1, Vec::new);
     }
@@ -135,6 +138,67 @@ fn set_cell_in_matrix(matrix: &mut Vec<Vec<CellValue>>, col: usize, row: usize, 
         matrix[row].resize(col + 1, CellValue::None);
     }
 
-    // 设置值
     matrix[row][col] = value;
 }
+
+fn replaced_cells_expression(expression: &str, data_base_matrix: &Vec<Vec<CellValue>>) -> Result<String, String>{
+    let re = Regex::new(r"([A-Z]+[0-9]+)").unwrap();
+    let mut replaced_expression = expression.to_string();
+
+    for cap in re.captures_iter(expression) {
+        let cell_ref = cap.get(0).unwrap().as_str();
+        if let Ok((col, row)) = split_key(cell_ref) {
+            if row < data_base_matrix.len() && col < data_base_matrix[row].len() {
+                let cell_value = &data_base_matrix[row][col];
+                match cell_value {
+                    CellValue::Int(value) => {
+                        replaced_expression = replaced_expression.replace(cell_ref, &value.to_string());
+                    },
+                    CellValue::None => {
+                        replaced_expression = replaced_expression.replace(cell_ref, "0");
+                    },
+                    _ => {
+                        return Err(format!("Error"));
+                    }
+                }
+            } else {
+                return Err(format!("Error"));
+            }
+        } else {
+            return Err(format!("Error"));
+        }
+    }
+    Ok(replaced_expression)
+}
+fn extract_matrix_for_sum(range: &str, matrix: &Vec<Vec<CellValue>>) -> CellArgument {
+    let bounds = range.split('_').collect::<Vec<_>>();
+    if bounds.len() == 2 {
+        if let (Ok((start_col, start_row)), Ok((end_col, end_row))) = (split_key(bounds[0]), split_key(bounds[1])) {
+            // println!("{},{},,{}{}",start_col,start_row,end_col,end_row);
+            let mut values = vec![];
+            let max_row = matrix.len();
+            let max_col = if !matrix.is_empty() { matrix[0].len() } else { 0 };
+
+            for row in start_row..=end_row {
+                let mut row_values = vec![];
+                if row < max_row {
+                    for col in start_col..=end_col {
+                        if col < max_col {
+                            row_values.push(matrix[row][col].clone());
+                        } else {
+                            row_values.push(CellValue::None);
+                        }
+                    }
+                    values.push(row_values);
+                } else {
+                    values.push(vec![CellValue::None; (end_col - start_col + 1).min(max_col)]);
+                }
+            }
+            return CellArgument::Matrix(values);
+        }
+    }
+    CellArgument::Matrix(vec![vec![CellValue::Error("Invalid range provided".to_string())]])
+}
+
+
+
