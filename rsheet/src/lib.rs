@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use regex::Regex;
 use std::error::Error;
+use std::thread;
+use std::sync::{Arc, Mutex};
 
 use log::info;
 
@@ -16,82 +18,171 @@ pub fn start_server<M>(mut manager: M) -> Result<(), Box<dyn Error>>
 where
     M: Manager,
 {
-    let (mut recv, mut send) = manager.accept_new_connection().unwrap();
-    // let mut data_base: HashMap<String, CellValue> = HashMap::new();
-    let mut data_base_matrix: Vec<Vec<CellValue>> = vec![vec![CellValue::None; 10]; 26];
+    let data_base_matrix = Arc::new(Mutex::new(vec![vec![CellValue::None; 10]; 26]));
 
     loop {
-        info!("Just got message");
-        let mut msg = recv.read_message()?;
-        // send.write_message(Reply::Error(format!("{msg:?}")))?;
-        msg = msg.trim().to_string();
-        // println!("{msg:?}");
-
-        let parts: Vec<&str> = msg.split_whitespace().collect();
-        
-        // let matrix = CellArgument::matrix;
-        match parts.get(0) {
-            Some(&"get") => {
-                if !check_format(parts[1]) {
-                    send.write_message(Reply::Error(format!("Invalid key Provided")));
-                } else if check_format(parts[1]) {
-                    if let Ok((col, row)) = split_key(parts[1]) {
-                        if row < data_base_matrix.len() && col < data_base_matrix[row].len() {
-                            let cell_value = &data_base_matrix[row][col];
-                            match cell_value {
-                                CellValue::Error(err) => {
-                                    send.write_message(Reply::Error(format!("{} = Error: '{}'", parts[1], err)))
-                                },
-                                _ => {
-                                    send.write_message(Reply::Value(parts[1].to_string(), cell_value.clone()))
-                                }
-                            }?;
-                        }    
-                    }
-                }
-            },
-
-            Some(&"set") => {
-                if parts.len() < 3 {
-                    send.write_message(Reply::Error(format!("Syntax error")));
-                } else if !check_format(parts[1]) {
-                    send.write_message(Reply::Error(format!("Invalid Key Provided")));
-                } else {
-                    let key = parts[1];
-                    let expression = parts[2..].join(" ");
-                    if expression.starts_with("sum"){
-                        let range = &expression[4..expression.len()-1];
-                        let matrix_arg = extract_matrix_for_sum(range, &data_base_matrix);
-                        // println!("{:?}", matrix_arg);
-                        let result = CommandRunner::new(&format!("sum({})", range)).run(&HashMap::from([(range.to_string(), matrix_arg)]));
-                        if let Ok((col, row)) = split_key(parts[1]) {
-                            set_cell_in_matrix(&mut data_base_matrix, col, row, result.clone());
-                        }
-                        send.write_message(Reply::Value(key.to_string(), result))?;
-                    } else {
-                        match replaced_cells_expression(&expression, &data_base_matrix) {
-                            Ok(replaced_expression) => {
-                                let runner = CommandRunner::new(&replaced_expression);
-                                let result = runner.run(&HashMap::new());
-                                if let Ok((col, row)) = split_key(parts[1]) {
-                                    set_cell_in_matrix(&mut data_base_matrix, col, row, result.clone());
-                                }
-                                println!("{}", result);
-                            },
-    
-                            Err(e) => {
-                                send.write_message(Reply::Error(format!("Error")))?;
-                            }
-                        };
-                    }
-                    
-                }
-            },
-
-            _ => todo!()
+        if let Ok((reader, writer)) = manager.accept_new_connection() {
+            let db_matrix_clone = Arc::clone(&data_base_matrix);
+            thread::spawn(move || {
+                handle_connection(reader, writer, db_matrix_clone);
+            });
         }
     }
 }
+
+fn handle_connection<R, W>(mut reader: R, mut writer: W, data_base_matrix: Arc<Mutex<Vec<Vec<CellValue>>>>)
+where
+    R: Reader,
+    W: Writer,
+{
+    loop {
+        let msg = match reader.read_message() {
+            Ok(msg) => msg.trim().to_string(),
+            Err(_) => break,
+        };
+
+        let parts: Vec<&str> = msg.split_whitespace().collect();
+        if parts.is_empty() {
+            continue;
+        }
+
+        let cmd = parts[0];
+        match cmd {
+            "get" => {
+                if let Some(key) = parts.get(1) {
+                    if let Ok((col, row)) = split_key(key) {
+                        let matrix = data_base_matrix.lock().unwrap();
+                        if row < matrix.len() && col < matrix[row].len() {
+                            let cell_value = &matrix[row][col];
+                            let reply = match cell_value {
+                                CellValue::Error(err) => Reply::Error(format!("{} = Error: '{}'", key, err)),
+                                _ => Reply::Value(key.to_string(), cell_value.clone())
+                            };
+                            writer.write_message(reply).ok();
+                        }
+                    }
+                }
+            },
+            "set" => {
+                if parts.len() >= 3 {
+                    let key = parts[1];
+                    let expression = parts[2..].join(" ");
+                    if expression.starts_with("sum") {
+                        let range = &expression[4..expression.len()-1];
+                        let matrix_arg = {
+                            let matrix = data_base_matrix.lock().unwrap();
+                            extract_matrix_for_sum(range, &matrix)
+                        };
+                        let result = CommandRunner::new(&format!("sum({})", range)).run(&HashMap::from([(range.to_string(), matrix_arg)]));
+                        if let Ok((col, row)) = split_key(key) {
+                            let mut matrix = data_base_matrix.lock().unwrap();
+                            set_cell_in_matrix(&mut matrix, col, row, result.clone());
+                        }
+                        writer.write_message(Reply::Value(key.to_string(), result)).ok();
+                    } else {
+                        let result_expression = {
+                            let matrix = data_base_matrix.lock().unwrap();
+                            replaced_cells_expression(&expression, &matrix)
+                        };
+                        if let Ok(replaced_expression) = result_expression {
+                            let result = CommandRunner::new(&replaced_expression).run(&HashMap::new());
+                            if let Ok((col, row)) = split_key(key) {
+                                let mut matrix = data_base_matrix.lock().unwrap();
+                                set_cell_in_matrix(&mut matrix, col, row, result.clone());
+                            }
+                            // writer.write_message(Reply::Value(key.to_string(), result)).ok();
+                        }
+                    }
+                } else {
+                    writer.write_message(Reply::Error(String::from("Syntax error"))).ok();
+                }
+            },
+            _ => writer.write_message(Reply::Error(String::from("Unknown command"))).ok().expect("REASON"),
+        }
+    }
+}
+
+
+// pub fn start_server<M>(mut manager: M) -> Result<(), Box<dyn Error>>
+// where
+//     M: Manager,
+// {
+//     let (mut recv, mut send) = manager.accept_new_connection().unwrap();
+//     // let mut data_base: HashMap<String, CellValue> = HashMap::new();
+//     let mut data_base_matrix: Vec<Vec<CellValue>> = vec![vec![CellValue::None; 10]; 26];
+
+//     loop {
+//         info!("Just got message");
+//         let mut msg = recv.read_message()?;
+//         // send.write_message(Reply::Error(format!("{msg:?}")))?;
+//         msg = msg.trim().to_string();
+//         // println!("{msg:?}");
+
+//         let parts: Vec<&str> = msg.split_whitespace().collect();
+        
+//         // let matrix = CellArgument::matrix;
+//         match parts.get(0) {
+//             Some(&"get") => {
+//                 if !check_format(parts[1]) {
+//                     send.write_message(Reply::Error(format!("Invalid key Provided")));
+//                 } else if check_format(parts[1]) {
+//                     if let Ok((col, row)) = split_key(parts[1]) {
+//                         if row < data_base_matrix.len() && col < data_base_matrix[row].len() {
+//                             let cell_value = &data_base_matrix[row][col];
+//                             match cell_value {
+//                                 CellValue::Error(err) => {
+//                                     send.write_message(Reply::Error(format!("{} = Error: '{}'", parts[1], err)))
+//                                 },
+//                                 _ => {
+//                                     send.write_message(Reply::Value(parts[1].to_string(), cell_value.clone()))
+//                                 }
+//                             }?;
+//                         }    
+//                     }
+//                 }
+//             },
+
+//             Some(&"set") => {
+//                 if parts.len() < 3 {
+//                     send.write_message(Reply::Error(format!("Syntax error")));
+//                 } else if !check_format(parts[1]) {
+//                     send.write_message(Reply::Error(format!("Invalid Key Provided")));
+//                 } else {
+//                     let key = parts[1];
+//                     let expression = parts[2..].join(" ");
+//                     if expression.starts_with("sum"){
+//                         let range = &expression[4..expression.len()-1];
+//                         let matrix_arg = extract_matrix_for_sum(range, &data_base_matrix);
+//                         // println!("{:?}", matrix_arg);
+//                         let result = CommandRunner::new(&format!("sum({})", range)).run(&HashMap::from([(range.to_string(), matrix_arg)]));
+//                         if let Ok((col, row)) = split_key(parts[1]) {
+//                             set_cell_in_matrix(&mut data_base_matrix, col, row, result.clone());
+//                         }
+//                         send.write_message(Reply::Value(key.to_string(), result))?;
+//                     } else {
+//                         match replaced_cells_expression(&expression, &data_base_matrix) {
+//                             Ok(replaced_expression) => {
+//                                 let runner = CommandRunner::new(&replaced_expression);
+//                                 let result = runner.run(&HashMap::new());
+//                                 if let Ok((col, row)) = split_key(parts[1]) {
+//                                     set_cell_in_matrix(&mut data_base_matrix, col, row, result.clone());
+//                                 }
+//                                 println!("{}", result);
+//                             },
+    
+//                             Err(e) => {
+//                                 send.write_message(Reply::Error(format!("Error")))?;
+//                             }
+//                         };
+//                     }
+                    
+//                 }
+//             },
+
+//             _ => todo!()
+//         }
+//     }
+// }
 
 fn check_format(key: &str) -> bool {
     let re = Regex::new(r"^([A-Z]+)(\d+)$").unwrap();
