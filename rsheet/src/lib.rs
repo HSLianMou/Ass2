@@ -2,13 +2,13 @@ use rsheet_lib::connect::{Manager, Reader, Writer};
 use rsheet_lib::replies::Reply;
 
 use std::collections::HashMap;
-use std::fmt::Debug;
+// use std::fmt::Debug;
 use regex::Regex;
 use std::error::Error;
 use std::thread;
 use std::sync::{Arc, Mutex};
 
-use log::info;
+// use log::info;
 
 use rsheet_lib::cell_value::CellValue;
 use rsheet_lib::command_runner::{CommandRunner, CellArgument};
@@ -26,6 +26,8 @@ where
             thread::spawn(move || {
                 handle_connection(reader, writer, db_matrix_clone);
             });
+        } else {
+            break;
         }
     }
 }
@@ -49,7 +51,10 @@ where
         let cmd = parts[0];
         match cmd {
             "get" => {
-                if let Some(key) = parts.get(1) {
+                if !check_format(parts[1]) {
+                    let _ = writer.write_message(Reply::Error(format!("Invalid key Provided")));
+                } else if check_format(parts[1]) {
+                    let key = parts[1];
                     if let Ok((col, row)) = split_key(key) {
                         let matrix = data_base_matrix.lock().unwrap();
                         if row < matrix.len() && col < matrix[row].len() {
@@ -64,7 +69,11 @@ where
                 }
             },
             "set" => {
-                if parts.len() >= 3 {
+                if parts.len() < 3 {
+                    let _ = writer.write_message(Reply::Error(format!("Syntax error")));
+                } else if !check_format(parts[1]) {
+                    let _ = writer.write_message(Reply::Error(format!("Invalid Key Provided")));
+                } else {
                     let key = parts[1];
                     let expression = parts[2..].join(" ");
                     if expression.starts_with("sum") {
@@ -93,8 +102,6 @@ where
                             // writer.write_message(Reply::Value(key.to_string(), result)).ok();
                         }
                     }
-                } else {
-                    writer.write_message(Reply::Error(String::from("Syntax error"))).ok();
                 }
             },
             _ => writer.write_message(Reply::Error(String::from("Unknown command"))).ok().expect("REASON"),
@@ -232,35 +239,62 @@ fn set_cell_in_matrix(matrix: &mut Vec<Vec<CellValue>>, col: usize, row: usize, 
     matrix[row][col] = value;
 }
 
-fn replaced_cells_expression(expression: &str, data_base_matrix: &Vec<Vec<CellValue>>) -> Result<String, String>{
-    let re = Regex::new(r"([A-Z]+[0-9]+)").unwrap();
-    let mut replaced_expression = expression.to_string();
+// fn replaced_cells_expression(expression: &str, data_base_matrix: &Vec<Vec<CellValue>>) -> Result<String, String>{
+//     let re = Regex::new(r"([A-Z]+[0-9]+)").unwrap();
+//     let mut replaced_expression = expression.to_string();
 
+//     for cap in re.captures_iter(expression) {
+//         let cell_ref = cap.get(0).unwrap().as_str();
+//         if let Ok((col, row)) = split_key(cell_ref) {
+//             if row < data_base_matrix.len() && col < data_base_matrix[row].len() {
+//                 let cell_value = &data_base_matrix[row][col];
+//                 match cell_value {
+//                     CellValue::Int(value) => {
+//                         replaced_expression = replaced_expression.replace(cell_ref, &value.to_string());
+//                     },
+//                     CellValue::None => {
+//                         replaced_expression = replaced_expression.replace(cell_ref, "0");
+//                     },
+//                     _ => {
+//                         return Err(format!("Error"));
+//                     }
+//                 }
+//             } else {
+//                 return Err(format!("Error"));
+//             }
+//         } else {
+//             return Err(format!("Error"));
+//         }
+//     }
+//     Ok(replaced_expression)
+// }
+
+fn replaced_cells_expression(expression: &str, data_base_matrix: &Vec<Vec<CellValue>>) -> Result<String, String> {
+    let re = Regex::new(r"([A-Z]+[0-9]+)").unwrap();
+    let mut result_expression = String::with_capacity(expression.len());
+
+    let mut last_end = 0;
     for cap in re.captures_iter(expression) {
-        let cell_ref = cap.get(0).unwrap().as_str();
-        if let Ok((col, row)) = split_key(cell_ref) {
-            if row < data_base_matrix.len() && col < data_base_matrix[row].len() {
-                let cell_value = &data_base_matrix[row][col];
-                match cell_value {
-                    CellValue::Int(value) => {
-                        replaced_expression = replaced_expression.replace(cell_ref, &value.to_string());
-                    },
-                    CellValue::None => {
-                        replaced_expression = replaced_expression.replace(cell_ref, "0");
-                    },
-                    _ => {
-                        return Err(format!("Error"));
-                    }
-                }
-            } else {
-                return Err(format!("Error"));
-            }
-        } else {
-            return Err(format!("Error"));
+        let match_str = cap.get(0).unwrap().as_str();
+        let (col, row) = split_key(match_str).map_err(|_| "Invalid cell reference")?;
+        
+        if row < data_base_matrix.len() && col < data_base_matrix[row].len() {
+            let value_str = match &data_base_matrix[row][col] {
+                CellValue::Int(value) => value.to_string(),
+                CellValue::None => "0".to_string(),
+                _ => return Err("Error".to_string()),
+            };
+            
+            result_expression.push_str(&expression[last_end..cap.get(0).unwrap().start()]);
+            result_expression.push_str(&value_str);
+            last_end = cap.get(0).unwrap().end();
         }
     }
-    Ok(replaced_expression)
+
+    result_expression.push_str(&expression[last_end..]);
+    Ok(result_expression)
 }
+
 fn extract_matrix_for_sum(range: &str, matrix: &Vec<Vec<CellValue>>) -> CellArgument {
     let bounds = range.split('_').collect::<Vec<_>>();
     if bounds.len() == 2 {
